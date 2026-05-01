@@ -1,13 +1,11 @@
 require("dotenv").config();
-
-const express = require("express");
-const TelegramBot = require("node-telegram-bot-api");
-const axios = require("axios");
+const { Telegraf } = require("telegraf");
 const admin = require("firebase-admin");
-const PDFDocument = require("pdfkit");
-const fs = require("fs");
 
-// ================= FIRESTORE =================
+// ===== INIT BOT =====
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// ===== FIREBASE SETUP (for Railway) =====
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
 admin.initializeApp({
@@ -15,165 +13,106 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
-const ordersRef = db.collection("orders");
 
-// ================= EXPRESS =================
-const app = express();
-app.use(express.json());
+// ===== USER STATE (simple memory) =====
+const userState = {};
 
-// health check
-app.get("/", (req, res) => {
-  res.send("🚀 Prime Print API running");
-});
-
-// ================= QUOTE =================
-function calculateQuote({ pages, size, color, quantity }) {
-  let price = color === "color" ? 0.8 : 0.3;
-  if (size === "A3") price *= 1.5;
-  return Math.ceil(pages * price * quantity);
-}
-
-// ================= PAYSTACK =================
-async function initializePayment(email, amount, orderId) {
-  const res = await axios.post(
-    "https://api.paystack.co/transaction/initialize",
+// ===== START COMMAND =====
+bot.start((ctx) => {
+  ctx.reply(
+    "👋 Welcome to Prime Print Digital\n\nChoose an option:",
     {
-      email,
-      amount: amount * 100,
-      callback_url: `${process.env.BASE_URL}/verify?orderId=${orderId}`
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET}`
-      }
+      reply_markup: {
+        keyboard: [
+          ["🛒 Place Order"],
+          ["💰 Get Quote"],
+          ["📦 Track Order"],
+        ],
+        resize_keyboard: true,
+      },
     }
   );
-
-  return res.data.data.authorization_url;
-}
-
-// ================= TELEGRAM =================
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
-console.log("🤖 Bot started...");
-
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-`👋 Welcome to Prime Print Digital
-
-1️⃣ Place Order
-2️⃣ Get Quote
-3️⃣ Track Order`);
 });
 
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
-
-  // ORDER
-  if (text === "1️⃣ Place Order") {
-    bot.sendMessage(chatId, "📦 Describe your print:");
-
-    bot.once("message", async (msg2) => {
-      const orderId = Date.now().toString();
-
-      await ordersRef.doc(orderId).set({
-        orderId,
-        userId: chatId,
-        details: msg2.text,
-        amount: 50,
-        status: "pending",
-        paymentStatus: "unpaid"
-      });
-
-      const link = await initializePayment(
-        "customer@email.com",
-        50,
-        orderId
-      );
-
-      bot.sendMessage(chatId,
-`✅ Order Created
-ID: ${orderId}
-Amount: GHS 50
-
-💳 Pay here:
-${link}`);
-    });
-  }
-
-  // QUOTE
-  if (text === "2️⃣ Get Quote") {
-    bot.sendMessage(chatId, "Send: 10,A4,color,2");
-
-    bot.once("message", (msg2) => {
-      const [p, s, c, q] = msg2.text.split(",");
-
-      const price = calculateQuote({
-        pages: Number(p),
-        size: s,
-        color: c,
-        quantity: Number(q)
-      });
-
-      bot.sendMessage(chatId, `💰 Price: GHS ${price}`);
-    });
-  }
-
-  // TRACK
-  if (text === "3️⃣ Track Order") {
-    bot.sendMessage(chatId, "Send Order ID:");
-
-    bot.once("message", async (msg2) => {
-      const doc = await ordersRef.doc(msg2.text).get();
-
-      if (!doc.exists) {
-        return bot.sendMessage(chatId, "❌ Order not found");
-      }
-
-      const order = doc.data();
-
-      bot.sendMessage(chatId,
-`📦 Status: ${order.status}
-💳 Payment: ${order.paymentStatus}`);
-    });
-  }
+// ===== PLACE ORDER BUTTON =====
+bot.hears("🛒 Place Order", (ctx) => {
+  userState[ctx.from.id] = { step: "product" };
+  ctx.reply("🛒 What do you want to print?\n(e.g. T-shirt, Banner)");
 });
 
-// ================= VERIFY =================
-app.get("/verify", async (req, res) => {
-  const { reference, orderId } = req.query;
+// ===== GET QUOTE =====
+bot.hears("💰 Get Quote", (ctx) => {
+  ctx.reply("💰 Send details:\nProduct, Quantity, Size");
+});
 
-  try {
-    const verify = await axios.get(
-      `https://api.paystack.co/transaction/verify/${reference}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.PAYSTACK_SECRET}`
-        }
-      }
+// ===== TRACK ORDER =====
+bot.hears("📦 Track Order", (ctx) => {
+  ctx.reply("📦 Send your Order ID");
+});
+
+// ===== ORDER FLOW =====
+bot.on("text", async (ctx) => {
+  const userId = ctx.from.id;
+  const text = ctx.message.text;
+
+  // Ignore commands
+  if (text.startsWith("/")) return;
+
+  const state = userState[userId];
+
+  // ===== STEP 1: PRODUCT =====
+  if (state && state.step === "product") {
+    state.product = text;
+    state.step = "quantity";
+    return ctx.reply("📦 Enter quantity:");
+  }
+
+  // ===== STEP 2: QUANTITY =====
+  if (state && state.step === "quantity") {
+    state.quantity = text;
+    state.step = "details";
+    return ctx.reply("📝 Any extra details? (size, color, design)");
+  }
+
+  // ===== STEP 3: DETAILS + SAVE =====
+  if (state && state.step === "details") {
+    state.details = text;
+
+    const order = {
+      userId,
+      product: state.product,
+      quantity: state.quantity,
+      details: state.details,
+      date: new Date(),
+    };
+
+    // Save to Firestore
+    const docRef = await db.collection("orders").add(order);
+
+    // Reply to user
+    ctx.reply(
+      `✅ Order placed successfully!\n\n🆔 Order ID: ${docRef.id}`
     );
 
-    if (verify.data.data.status === "success") {
-      await ordersRef.doc(orderId).update({
-        paymentStatus: "paid",
-        status: "processing",
-        reference
-      });
+    // Send to admin
+    bot.telegram.sendMessage(
+      process.env.ADMIN_ID,
+      `📥 NEW ORDER\n\nProduct: ${state.product}\nQuantity: ${state.quantity}\nDetails: ${state.details}\nUser: ${userId}`
+    );
 
-      res.send("✅ Payment successful");
-    } else {
-      res.send("❌ Payment failed");
-    }
-
-  } catch (err) {
-    res.send("Error verifying payment");
+    // Clear state
+    delete userState[userId];
+    return;
   }
+
+  // ===== DEFAULT =====
+  ctx.reply("Please use the buttons below 👇");
 });
 
-// ================= START =================
-const PORT = process.env.PORT || 3000;
+// ===== START SERVER =====
+bot.launch();
+console.log("🚀 Bot is running...");
 
-app.listen(PORT, () => {
-  console.log("🚀 Server running on port " + PORT);
-});
+// ===== GRACEFUL STOP =====
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
